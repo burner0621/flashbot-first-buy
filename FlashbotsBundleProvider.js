@@ -7,6 +7,7 @@ import { readJSONFromFile, writeJSONToFile } from './fileload.js';
 import UniswapV2Router02ABI from "@uniswap/v2-periphery/build/UniswapV2Router02.json" assert { type: 'json' };
 import ERC20ABI from "@uniswap/v2-core/build/ERC20.json" assert { type: 'json' };
 import bribeABI from "./assets/coinbase.json" assert { type: 'json' };
+import { TOKEN_ABI } from "./abi/TOKEN_ABI.js"
 
 const MAX_FEE = 0.000041;
 
@@ -24,7 +25,7 @@ const options = {
 let wallets = [];
 
 // let provider = new ethers.getDefaultProvider(process.env.CHAINNAME);
-let provider = new ethers.JsonRpcProvider('https://sepolia.drpc.org')
+let provider = new ethers.JsonRpcProvider(process.env.ETHEREUM_RPC_HTTP_URL)
 let wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
 let amountTokenDesired = parseUnits(process.env.TOKEN_FOR_LIQUIDITY, 18); // Amount of your token
@@ -49,16 +50,14 @@ let flashbotsProvider = await FlashbotsBundleProvider.create(
   process.env.CHAINNAME
 );
 
-
-
-
-
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function generateWalletList() {
   console.log("Wallet generating...")
   if (wallets.length == 0) {
     wallets = readJSONFromFile('wallets.json');
-    if (wallets.length == 0) {
+    if (!wallets || (wallets && wallets.length == 0)) {
+      wallets = []
       for (let i = 0; i < parseInt(process.env.WALLET_DIST_COUNT); i++) {
         let result = utils.generateNewWallet();
         let _wallet = {
@@ -122,88 +121,158 @@ async function distributeWallets() {
   }
 }
 
-
-async function makeBundle() {
-  let bundle = [];
-
-  let deadline = Math.floor(Date.now() / 1000) + 60 * 20; // 20 minutes from the current time
+async function simulate() {
 
   let router = new ethers.Contract(process.env.UNISWAP_V2_ROUTER_ADDRESS, routerABI, wallet);
-  let token = new ethers.Contract(process.env.TOKEN_ADDRESS, tokenABI, wallet);
-  console.log("contract successed");
+  let token = new ethers.Contract(process.env.TOKEN_ADDRESS, TOKEN_ABI, wallet);
 
-  let preApproveTx = await token.approve.populateTransaction(process.env.UNISWAP_V2_ROUTER_ADDRESS, BigInt(1));
-  let res1 = await preApproveTx.wait();
+  let bundleTx = []
 
-  deadline = Math.floor(Date.now() / 1000) + 60 * 20;
-  let preAddLiquidityTx = await router.addLiquidityETH.populateTransaction(
-    process.env.TOKEN_ADDRESS,
-    BigInt(10),
-    BigInt(1),
-    BigInt(1),
-    wallet.address,
-    deadline,
-    { value: BigInt(10) }
-  );
-  let res2 = await preAddLiquidityTx.wait();
+  const feeData = await provider.getFeeData()
+  const maxFeePerGas = feeData.maxFeePerGas
+  const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas
 
-  deadline = Math.floor(Date.now() / 1000) + 60 * 20;
-  // Approve the router to spend your tokens
-  let approveTx = await token.approve.populateTransaction(process.env.UNISWAP_V2_ROUTER_ADDRESS, amountTokenDesired);
-  // let re1 = await approveTx.wait();
-  // console.log("transaction finished", re1)
-  // await approveTx.wait()
-  bundle.push({
-    signer: wallet,
-    transaction: approveTx
-  })
+  let tx
+  let args
 
-  // Add liquidity
-  let addLiquidityTx = await router.addLiquidityETH.populateTransaction(
-    process.env.TOKEN_ADDRESS,
-    amountTokenDesired,
-    amountTokenMin,
-    amountETHMin,
-    wallet.address,
-    deadline,
-    { value: amountETHDesired }
-  );
-  // let re2 = await addLiquidityTx.wait();
-  // console.log("transaction finished", re2)
-  bundle.push({
-    signer: wallet,
-    transaction: addLiquidityTx
-  });
+  // try{
+    let BRIBE_ETH = "0.1";
+    let bribeWei = parseEther(BRIBE_ETH).toString();
+    let bribeContract = new ethers.Contract(process.env.BRIBE_CONTRACT_ETH, bribeABI, wallet);
+    args = [{ value: bribeWei }];
+    let executeTx = await bribeContract.execute.populateTransaction(...args);
+    let executeGasLimit = await bribeContract.execute.estimateGas(...args);
+    tx = {
+      chainId: process.env.CHAINID,
+      type: 2,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasLimit: executeGasLimit,
+      data: executeTx.data,
+      to: executeTx.to,
+      value: bribeWei
+    }
+    bundleTx.push({
+      signer: wallet,
+      transaction: tx
+    })
+    
+    // add liquidity
+    args = [
+      process.env.TOKEN_ADDRESS,
+      amountTokenDesired.toString(),
+      0,
+      0,
+      wallet.address,
+      parseInt(Date.now() / 1000) + 1200,
+      { value: amountETHDesired.toString() }
+    ]
+    const addLiquidityTx = await router.addLiquidityETH.populateTransaction(...args)
+    const addLiquidityGasLimit = await router.addLiquidityETH.estimateGas(...args)
 
-  for (let i = 0; i < wallets.length; i++) {
-    let privateKey = utils.decryptPKey(wallets[i].pkey);
-    let _wallet = new ethers.Wallet(privateKey, provider);
+    tx = {
+      chainId: process.env.CHAINID,
+      type: 2,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasLimit: addLiquidityGasLimit,
+      data: addLiquidityTx.data,
+      to: addLiquidityTx.to,
+      value: amountETHDesired.toString()
+    }
+    bundleTx.push({
+      signer: wallet,
+      transaction: tx
+    })
 
-    let _router = new ethers.Contract(process.env.UNISWAP_V2_ROUTER_ADDRESS, routerABI, _wallet);
-    let _deadline = Math.floor(Date.now() / 1000) + 60 * 20;
-    let ethBalance = await provider.getBalance(_wallet.address)
+    // enable trading
+    args = []
+    const enableTx = await token.enableTrading.populateTransaction(...args)
+    const enableGasLimit = await token.enableTrading.estimateGas(...args)
+    tx = {
+      chainId: process.env.CHAINID,
+      type: 2,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
+      gasLimit: enableGasLimit,
+      data: enableTx.data,
+      to: enableTx.to
+    }
+    bundleTx.push({
+      signer: wallet,
+      transaction: tx
+    })
 
-    let _amount = parseFloat(process.env.ETH_FOR_LIQUIDITY) / wallets.length * 0.2;
+    // swap transactions
+    console.log ("wallets.length: ",wallets.length)
+    for (let i = 0; i < wallets.length; i++) {
+      let privateKey = utils.decryptPKey(wallets[i].pkey);
+      let _wallet = new ethers.Wallet(privateKey, provider);
 
-    console.log(_wallet.address, _amount);
+      let _router = new ethers.Contract(process.env.UNISWAP_V2_ROUTER_ADDRESS, routerABI, _wallet);
+      let _deadline = Math.floor(Date.now() / 1000) + 60 * 20;
 
-    if (_amount > 0) {
-      let buyTx = await _router.swapExactETHForTokens.populateTransaction(
-        0,
-        ['0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9', process.env.TOKEN_ADDRESS],
-        _wallet.address,
-        _deadline,
-        { value: parseUnits(_amount.toString(), 18) }
-      )
-      bundle.push({
-        signer: _wallet,
-        transaction: buyTx
-      });
+      let _amount = parseFloat(process.env.ETH_FOR_LIQUIDITY) / wallets.length * 0.2;
+
+      if (_amount > 0) {
+        args = [
+          0,
+          ['0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9', process.env.TOKEN_ADDRESS],
+          _wallet.address,
+          _deadline,
+          { value: parseUnits(_amount.toString(), 18) }
+        ]
+        let buyTx = await _router.swapExactETHForTokensSupportingFeeOnTransferTokens.populateTransaction(...args)
+        // let buyGasLimit = await _router.swapExactETHForTokensSupportingFeeOnTransferTokens.estimateGas(...args)
+
+        tx = {
+          chainId: process.env.CHAINID,
+          type: 2,
+          maxFeePerGas,
+          maxPriorityFeePerGas,
+          gasLimit: "1000000",
+          data: buyTx.data,
+          to: buyTx.to,
+          value: parseUnits(_amount.toString(), 18)
+        }
+        bundleTx.push({
+          signer: _wallet,
+          transaction: tx
+        });
+      }
+
     }
 
-  }
+    const signedTxBundle = await flashbotsProvider.signBundle(bundleTx);
+    const blockNumber = await provider.getBlockNumber()
+    const simulation = await flashbotsProvider.simulate(signedTxBundle, blockNumber + 1)
 
-  return bundle;
+    if (simulation.error) {
+      console.log ("Failed in simulation...", simulation.error)
+      return []
+    } else {
+      console.log ("Succeed simulation!")
+      return bundleTx
+    }
+  // } catch (err) {
+  //   console.log ("Failed simulation...", err)
+  //   return []
+  // }
+}
+
+async function makeBundle() {
+  let token = new ethers.Contract(process.env.TOKEN_ADDRESS, tokenABI, wallet);
+
+  let deadline = Math.floor(Date.now() / 1000) + 60 * 20;
+  // Approve the router to spend your tokens
+  // console.log ("Approving started...")
+  // let approveTx = await token.approve(process.env.UNISWAP_V2_ROUTER_ADDRESS, amountTokenDesired);
+  // await approveTx.wait();
+  // console.log ("Approved successfully...")
+
+  const bundleTx = await simulate()
+
+  return bundleTx;
 }
 
 const receiveEthFrom = async (amount, recipientAddress, pkey) => {
@@ -302,104 +371,89 @@ async function gatherWallets() {
  * 
  * *********/
 async function sendBundleTransaction() {
-  let CHAIN_ID = parseInt(process.env.CHAINID);
-  let BRIBE_ETH = "0.05";
-  let feeData = await provider.getFeeData();
-  let maxFeePerGas = feeData.maxFeePerGas;
-  let maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
-
-  let bribeWei = parseEther(BRIBE_ETH).toString();
-  let bribeAddress = process.env.BRIBE_CONTRACT_ETH;
-  let bribeContract = new ethers.Contract(bribeAddress, bribeABI, wallet);
-  let args = [{ value: bribeWei }];
-  let execute = await bribeContract.execute.populateTransaction(...args);
-  let gasLimit = (await bribeContract.execute.estimateGas(...args)).toString();
-
   let transactionBundle = await makeBundle();
+  console.log ("transactionBundle length: ", transactionBundle.length)
 
-  let lastTx = {
-    value: BigInt(bribeWei),
-    to: execute.to,
-    data: execute.data,
-    chainId: CHAIN_ID,
-    type: 2,
-    maxFeePerGas,
-    maxPriorityFeePerGas,
-    gasLimit,
-  };
+  if (transactionBundle.length === 0) {
+    console.log ("Something went wrong!")
+    return
+  }
 
-  transactionBundle.forEach(tx => {
-    tx.transaction.chainId = CHAIN_ID;
-    tx.transaction.type = 2;
-    tx.transaction.maxFeePerGas = maxFeePerGas;
-    tx.transaction.maxPriorityFeePerGas = maxPriorityFeePerGas;
-    tx.transaction.gasLimit = '280000';
-  })
-
-  transactionBundle.splice(0, 0, {
-    signer: wallet,
-    transaction: lastTx
-  });
-
-  console.log("TransactionBundle: ", transactionBundle)
-  // exit(1)
+  let error
+  let successed = false;
+  let abort = false;
   let oldBlockNumber = 0;
-  while (true) {
+  let firstBlockNumber = 0;
+  const signedTransactions = await flashbotsProvider.signBundle(transactionBundle);
+  while (!abort) {
     let blockNumber = await provider.getBlockNumber();
-    while (oldBlockNumber === blockNumber) {
+    while (oldBlockNumber !== 0 && oldBlockNumber === blockNumber) {
       await sleep(1000);
       blockNumber = await provider.getBlockNumber();
     }
     oldBlockNumber = blockNumber;
 
-    const signedTransactions = await flashbotsProvider.signBundle(transactionBundle);
-    console.log("signed Transaction:", signedTransactions);
+    const simulation = await flashbotsProvider.simulate(signedTransactions, blockNumber + 2)
+    
+    if (simulation.results) {
+      error = null;
+      for (let i = 0; i < simulation.results.length; i++) {
+          if ("error" in simulation.results[i]) {
+              error = simulation.results[i];
+              break;
+          }
+      }
+      console.log ("error ===>", error)
+      if (!error) {
+        const bundleTxRes = await flashbotsProvider.sendRawBundle(signedTransactions, blockNumber + 2);
+        await bundleTxRes.wait();
+        const receipts = await bundleTxRes.receipts()
+        console.log ("response ===>", receipts)
+        for (let i = 0 ; i < receipts.length ; i ++) {
+          if (receipts[i] === null) break
 
-    const simulation = await flashbotsProvider.simulate(signedTransactions, blockNumber + 1)
-    if ("error" in simulation) {
-      console.log(`Simulation Error: ${simulation.error.message}`);
-    } else {
-      console.log("BundleHash:", simulation)
+          successed = true
+          abort = true
+        }
+        // if (!response) {
+        //     successed = true;
+        //     abort = true;
+        // } else if (blockNumber - firstBlockNumber >= 50) {
+        //     abort = true;
+        // }
+      }
     }
+  }
 
-    const bundleSubmission = await flashbotsProvider.sendRawBundle(
-      signedTransactions,
-      blockNumber + 1
-    );
-
-    const waitResponse = await bundleSubmission.wait();
-    console.log("+++++Wait Response:", waitResponse);
-
-    if (waitResponse == 0) {
-      console.log("Success!");
-      break;
-    }
-    //   blockNumber ++;
+  if (successed) {
+    console.log ("Bundled successfully!")
+  } else {
+    console.log ("Bundled failed!")
   }
 }
 
 async function main() {
   await generateWalletList();
 
-  await distributeWallets();
+  // await distributeWallets();
 
   await sendBundleTransaction();
 
 
-  await gatherWallets();
-  //   console.log('end');
+  // await gatherWallets();
+  console.log('end');
 }
 
-// main()
+main()
 
-let string = '['
-for (let i=0;i<10000;i++){
-    let wallet = utils.generateNewWallet()
+// let string = '['
+// for (let i=0;i<10000;i++){
+//     let wallet = utils.generateNewWallet()
 
-    string = string + wallet.address;
-    if (i != 9999) {
-        string = string + ', '
-    }
-}
-string += ']';
-console.log(string)
+//     string = string + wallet.address;
+//     if (i != 9999) {
+//         string = string + ', '
+//     }
+// }
+// string += ']';
+// console.log(string)
